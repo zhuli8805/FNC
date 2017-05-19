@@ -1,0 +1,281 @@
+import numpy as np
+import random
+import pickle
+from tqdm import tqdm
+import os
+
+from learningCurve import plot_learning_curve
+
+from sklearn.neural_network import MLPClassifier, BernoulliRBM
+from sklearn.datasets import load_iris
+from sklearn import tree
+from sklearn.naive_bayes import GaussianNB
+from sklearn.model_selection import ShuffleSplit
+
+from utils.dataset import DataSet
+from utils.generate_test_splits import split
+from utils.score import report_score
+
+import re
+
+import nltk
+from nltk.corpus import brown
+from nltk.stem import PorterStemmer
+from nltk import ngrams
+
+import gensim
+from gensim.models import word2vec, Doc2Vec
+from gensim.models.doc2vec import TaggedDocument
+
+from pycorenlp import StanfordCoreNLP
+nlp = StanfordCoreNLP('http://localhost:9000')
+
+_wnl = nltk.WordNetLemmatizer()
+
+if 'model' not in locals():
+    model = gensim.models.KeyedVectors.load_word2vec_format('GoogleNews-vectors-negative300.bin', binary=True)
+
+#with open("glove.6B\glove.6B.50d.txt", "rb") as lines:
+#    w2v = {line.split()[0]: np.array(map(float, line.split()[1:]))
+#           for line in lines}
+#print(w2v)
+
+
+def normalize_word(w):
+    return _wnl.lemmatize(w).lower()
+
+def get_tokenized_lemmas(s):
+    return [normalize_word(t) for t in nltk.word_tokenize(s)]
+
+def preprocessor(sentence):
+    res = " ".join(re.findall(r'\w+', sentence, flags=re.UNICODE)) # .lower()
+    res = get_tokenized_lemmas(res)
+    return res
+
+#POS_types = ['CD', 'PRP$', 'MD', 'WDT', ':', 'JJS', 'DT', 'RP', 'TO', 'VB', 'RB', 'UH', 'POS', 'VBP', '#', 'NNP', 'PDT', '$', '``', 'JJ', 'NNS', 'IN', '.', 'PRP', 'WP$', 'RBR', 'VBZ', 'NN', ',', 'RBS', "''", '-RRB-', 'VBD', 'WP', '-LRB-', 'JJR', 'LS', 'SYM', 'FW', 'VBG', 'NNPS', 'EX', 'WRB', 'VBN', 'CC']
+#NE_types = ['PERCENT', 'SET', 'TIME', 'DURATION', 'MISC', 'MONEY', 'LOCATION', 'ORGANIZATION', 'DATE', 'NUMBER', 'PERSON', 'ORDINAL']
+POS_types = ['JJ', 'VB', 'VBD', 'VBN', 'VBP', 'RB']
+NE_types = ['LOCATION', 'ORGANIZATION', 'PERSON']
+sentenceEnders = re.compile('[,.!?]')
+def phi2(text, bodyID = None):
+    if bodyID is not None:
+        if bodyID in phi2Dict_body:
+            return phi2Dict_body[bodyID]
+    elif text in phi2Dict_headLine:
+        return phi2Dict_headLine[text]
+    
+    pos_sum = {}
+    pos_count = {}
+    ne_sum = {}
+    ne_count = {}
+    sentiment_sum = 0
+    
+    for ne in NE_types:
+        ne_sum[ne] = np.zeros(300)
+        ne_count[ne] = 0
+    for pos in POS_types:
+        pos_sum[pos] = np.zeros(300)
+        pos_count[pos] = 0
+    
+    sentenceList = sentenceEnders.split(text)
+    for sentence in sentenceList:
+        anno = nlp.annotate(sentence, properties={'annotators': 'pos, sentiment, ner', 'outputFormat': 'json'})
+        if type(anno) == dict:
+            anno_sentences = anno['sentences']
+            for anno_sent in anno_sentences:
+                sentiment_sum += int(anno_sent['sentimentValue'])
+                for word in anno_sent['tokens']:
+                    if word['originalText'] in model:
+                        if word['ner'] in NE_types:
+                            ne_sum[word['ner']] += model[word['originalText']]
+                            ne_count[ne] += 1
+                        if word['pos'] in POS_types:                    
+                            pos_sum[word['pos']] += model[word['originalText']]
+                            pos_count[pos] += 1
+    f_pos = np.zeros(300)
+    f_ne = np.zeros(300)
+    for pos in POS_types:
+        if pos_count[pos] != 0:
+            f_pos += pos_sum[pos] / pos_count[pos]
+        else:
+            f_pos += np.zeros(300)
+    for ne in NE_types:
+        if ne_count[ne] != 0:
+            f_ne += ne_sum[ne] / ne_count[ne]
+        else:
+            f_ne += np.zeros(300)
+    sentiment_avg = sentiment_sum / len(sentenceList)
+    
+    
+    res = [sentiment_avg] + list(f_pos) + list(f_ne)
+    
+    if bodyID is not None:
+        phi2Dict_body[bodyID] = res
+    else:
+        phi2Dict_headLine[text] = res
+        
+    return res
+
+def phi(bodyID, body, headLine):
+    # get features from body
+    if bodyID in phiDict_body.keys():
+        f_body = phiDict_body[bodyID]
+    else:
+        f_body_sum = np.zeros(300)
+        body_processsed = preprocessor(body)
+        for word in body_processsed:
+            if word in model:
+                f_body_sum = np.add(f_body_sum, model[word])
+        f_body_avg = list(f_body_sum/len(body_processsed))
+        f_body = f_body_avg + list(phi2(body, bodyID))
+        phiDict_body[bodyID] = f_body
+    
+    # get features from headLine
+    if headLine in phiDict_headLine.keys():
+        f_headLine = phiDict_headLine[headLine]
+    else:
+        f_headLine_sum = np.zeros(300)
+        headLine_processsed = preprocessor(headLine)    
+        for word in headLine_processsed:
+            if word in model:
+                f_headLine_sum = np.add(f_headLine_sum, model[word])
+        f_headLine_avg = list(f_headLine_sum/len(headLine_processsed))
+        f_headLine = f_headLine_avg + list(phi2(headLine))
+        phiDict_headLine[headLine] = f_headLine
+            
+#    f_diff = [b-h for b,h in zip(f_body, f_headLine)]
+#    f_diff2 = [(b-h)*(b-h) for b,h in zip(f_body, f_headLine)]
+#    f = f_diff + f_diff2 + list(f_body) + list(f_headLine)
+    f = list(f_body) + list(f_headLine) 
+#    f = f_diff #+ f_diff2
+    return f
+
+def getDataList(_data):
+    print('>>> Getting features')
+    f_list = []
+    label_list = []
+    for i, stance in tqdm(enumerate(_data)):
+        headLine = stance['Headline']
+        body = dataset.articles[stance['Body ID']]
+        actual = stance['Stance']        
+        f = phi(stance['Body ID'], body, headLine)  
+        
+        f_list.append(f)
+        label_list.append(actual)    
+    return f_list, label_list 
+
+def train(f_list, label_list ):
+    print('>>> Training')
+    clf_MLP = MLPClassifier(solver='adam', alpha=1e-5, activation = 'logistic', hidden_layer_sizes=(100,), random_state=1)
+    clf_MLP.fit(f_list, label_list)
+
+#    clf_DT = tree.DecisionTreeClassifier(criterion = 'entropy')
+#    clf_DT = clf_DT.fit(f_list, label_list)
+    
+#    clf_RBM = BernoulliRBM()
+#    clf_RBM = clf_RBM.fit(f_list, label_list)
+        
+    return clf_MLP
+
+def test(clf, _data):
+    actualList = []
+    predictList = []
+    print('>>> Testing')
+    _f_list, _label_list = getDataList(_data)
+    for i, (f, actual) in tqdm(enumerate(zip(_f_list, _label_list))):
+        pred = clf.predict(np.array(f).reshape(1,-1))
+        predictList.append(pred)
+        
+        actualList.append(actual)
+        
+    report_score(actualList, predictList)
+    
+def save_obj(obj, name):
+    with open(name + '.pkl', 'wb') as f:
+        pickle.dump(obj, f, pickle.HIGHEST_PROTOCOL)
+
+def load_obj(name):
+    with open(name + '.pkl', 'rb') as f:
+        return pickle.load(f)
+
+def generatePhiDict():   
+    phiDict_body = {}
+    phi2Dict_body = {}
+    phiDict_headLine = {}
+    phi2Dict_headLine = {}
+    
+    headLine_set = set()
+    print('>>> Getting headlines')
+    data_all  = training_data+dev_data
+    for i, stance in tqdm(enumerate(data_all)):
+        headLine_set.add(stance['Headline'])
+    print('size = ', len(headLine_set))    
+    print('>>> Getting features')
+    for i, headLine in tqdm(enumerate(headLine_set)):
+        phi2Dict_headLine[headLine] = phi2(headLine)
+    
+    bodyIDset = set()
+    print('>>> Getting bodyIDs')
+    data_all  = training_data+dev_data
+    for i, stance in tqdm(enumerate(data_all)):
+        bodyIDset.add(stance['Body ID'])
+    print('size = ', len(bodyIDset))    
+    print('>>> Getting features')
+    for i, bodyID in tqdm(enumerate(bodyIDset)):
+        body = dataset.articles[bodyID]
+        phi2Dict_body[bodyID] = phi2(body)    
+
+    print('>>> Writing files')
+    save_obj(phiDict_body, 'phiDict_body' + version)
+    save_obj(phi2Dict_body, 'phi2Dict_body' + version)
+    save_obj(phiDict_headLine, 'phiDict_headLine' + version)
+    save_obj(phi2Dict_headLine, 'phi2Dict_headLine' + version)
+    
+    return
+    
+f_list = []
+label_list = []
+if __name__ == '__main__':
+    print('>>> Loading files')    
+    dataset = DataSet()
+    data_splits = split(dataset)
+    training_data = data_splits['training']
+#    dev_data = data_splits['dev']
+    test_data = data_splits['test']
+    del(data_splits)
+    
+    phiDict_body = {}
+    phi2Dict_body = {}
+    phiDict_headLine = {}
+    phi2Dict_headLine = {}
+    version = '_3'
+    if os.path.exists('phiDict_body' + version + '.pkl'):
+        phiDict_body = load_obj('phiDict_body' + version)
+    if os.path.exists('phi2Dict_body' + version + '.pkl'):
+        phiDict_body = load_obj('phi2Dict_body' + version)
+    if os.path.exists('phiDict_headLine' + version + '.pkl'):
+        phiDict_headLine = load_obj('phiDict_headLine' + version)
+    if os.path.exists('phi2Dict_headLine' + version + '.pkl'):
+        phi2Dict_headLine = load_obj('phi2Dict_headLine' + version)
+    
+    print('>>> Start')
+    
+    f_list_train, label_list_train = getDataList(training_data)
+    del(training_data) # release memory
+    clf = train(f_list_train, label_list_train)
+    f_list_dev, label_list_dev = getDataList(test_data)
+    test(clf, test_data)
+    
+    estimator = GaussianNB()
+    cv = ShuffleSplit(n_splits=100, test_size=0.2, random_state=0)
+    plot_learning_curve(estimator, 'Learning Curve', f_list_train, label_list_train, ylim=(0.7, 1.01), cv=cv, n_jobs=4)
+    
+    print('>>> Writing files')
+    save_obj(f_list, '_f_list_train')
+    save_obj(label_list, '_label_list_train')
+    save_obj(phiDict_body, 'phiDict_body' + version)
+    save_obj(phi2Dict_body, 'phi2Dict_body' + version)
+    save_obj(phiDict_headLine, 'phiDict_headLine' + version)
+    save_obj(phi2Dict_headLine, 'phi2Dict_headLine' + version)
+    
+    
